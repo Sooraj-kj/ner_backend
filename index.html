@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Soniox FastAPI Frontend</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        h1 {
+            color: #1a73e8;
+        }
+        #controls {
+            margin: 1rem 0;
+        }
+        button {
+            font-size: 1rem;
+            padding: 0.8rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin: 0 0.5rem;
+        }
+        #startButton {
+            background-color: #34a853;
+            color: white;
+        }
+        #startButton:disabled {
+            background-color: #a5d6a7;
+        }
+        #stopButton {
+            background-color: #ea4335;
+            color: white;
+        }
+        #stopButton:disabled {
+            background-color: #f4c7c3;
+        }
+        #status {
+            font-size: 1.1rem;
+            font-weight: 500;
+            margin-top: 1rem;
+            color: #5f6368;
+            height: 1.5rem;
+        }
+        #transcript-container {
+            width: 90%;
+            max-width: 800px;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            padding: 1.5rem;
+            margin-top: 1rem;
+            min-height: 200px;
+        }
+        h2 {
+            margin-top: 0;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 0.5rem;
+        }
+        #transcript {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            color: #202124;
+        }
+        #interim {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            color: #70757a;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Soniox WebSocket Proxy Frontend</h1>
+    <p>Using your FastAPI backend at <code>ws://localhost:8000/ws/soniox</code></p>
+
+    <div id="controls">
+        <button id="startButton">Start Recording</button>
+        <button id="stopButton" disabled>Stop Recording</button>
+    </div>
+
+    <div id="status">Press "Start Recording"</div>
+
+    <div id="transcript-container">
+        <h2>Transcription</h2>
+        <div id="transcript"></div>
+        <div id="interim"></div>
+    </div>
+
+    <script>
+        // DOM Elements
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusEl = document.getElementById('status');
+        const transcriptEl = document.getElementById('transcript');
+        const interimEl = document.getElementById('interim');
+
+        // WebSocket and Audio Context variables
+        let socket;
+        let audioContext;
+        let stream;
+        let scriptProcessor;
+        let gainNode;
+
+        const FASTAPI_WS_URL = "ws://localhost:8000/ws/soniox";
+        const TARGET_SAMPLE_RATE = 16000; // <-- CHANGE 1: Define 16kHz
+
+        // --- Event Listeners ---
+        startButton.onclick = startRecording;
+        stopButton.onclick = stopRecording;
+
+        // --- Core Functions ---
+
+        async function startRecording() {
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            statusEl.textContent = "Connecting to server...";
+            transcriptEl.textContent = "";
+            interimEl.textContent = "";
+
+            // 1. Create WebSocket connection
+            socket = new WebSocket(FASTAPI_WS_URL);
+
+            socket.onopen = async () => {
+                try {
+                    statusEl.textContent = "Requesting microphone access...";
+                    
+                    // 2. Get user media (microphone)
+                    // <-- CHANGE 2: Request 16000 Hz sample rate
+                    stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: { sampleRate: TARGET_SAMPLE_RATE } 
+                    });
+                    
+                    // 3. Setup AudioContext to process audio
+                    // <-- CHANGE 3: Create context with 16000 Hz
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: TARGET_SAMPLE_RATE
+                    });
+                    
+                    // 4. THIS IS THE CONFIGURATION SENT TO YOUR BACKEND
+                    // <-- CHANGE 4: Send the target sample rate
+                    const startConfig = {
+                        sample_rate: TARGET_SAMPLE_RATE, 
+                        model: "stt-rt-preview", // Example model
+         
+                    };
+
+                    // 5. Send the configuration as the *first* message
+                    socket.send(JSON.stringify(startConfig));
+                    
+                    statusEl.textContent = "Streaming audio...";
+
+                    // 6. Start streaming audio
+                    const source = audioContext.createMediaStreamSource(stream);
+                    
+                    // Use a 4096 buffer size
+                    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                    // Create a GainNode to mute the audio playback
+                    gainNode = audioContext.createGain();
+                    gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+
+                    // Connect the audio graph:
+                    // source -> scriptProcessor -> gainNode -> destination
+                    source.connect(scriptProcessor);
+                    scriptProcessor.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+
+                    // 7. Set the processor to send audio data on each buffer
+                    scriptProcessor.onaudioprocess = (e) => {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            const floatData = e.inputBuffer.getChannelData(0);
+                            const pcm16 = floatTo16BitPCM(floatData);
+                            socket.send(pcm16.buffer); // Send raw binary data
+                        }
+                    };
+
+                } catch (err) {
+                    console.error("Error starting recording:", err);
+                    statusEl.textContent = `Error: ${err.message}`;
+                    // Check if browser could not provide 16kHz
+                    if (err.name === "OverconstrainedError" || err.name === "ConstraintNotSatisfiedError") {
+                        statusEl.textContent = "Error: Cannot get 16kHz audio. Please check mic.";
+                    }
+                    stopRecording(); // Reset UI
+                }
+            };
+
+            socket.onmessage = (event) => {
+                // 8. Handle incoming transcription JSON
+                const data = JSON.parse(event.data);
+
+                if (data.words && data.words.length > 0) {
+                    // Reconstruct the text from the words array
+                    const text = data.words.map(w => w.text).join(' ');
+
+                    if (data.final) {
+                        // This is a final segment
+                        transcriptEl.innerHTML += text + ' ';
+                        interimEl.innerHTML = ''; // Clear interim text
+                    } else {
+                        // This is an interim (non-final) segment
+                        interimEl.innerHTML = text;
+                    }
+                }
+            };
+
+            socket.onerror = (error) => {
+                console.error("WebSocket Error:", error);
+                statusEl.textContent = "Connection error. See console.";
+                stopRecording();
+            };
+
+            socket.onclose = (event) => {
+                console.log("WebSocket Closed:", event.code, event.reason);
+                if (startButton.disabled) { // Only if not manually stopped
+                    statusEl.textContent = "Connection closed. Press Start.";
+                    stopRecording(); // Ensure cleanup
+                }
+            };
+        }
+
+        function stopRecording() {
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            statusEl.textContent = "Recording stopped. Press Start.";
+
+            // 1. Disconnect audio processor
+            if (scriptProcessor) {
+                scriptProcessor.onaudioprocess = null;
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (gainNode) {
+                gainNode.disconnect();
+                gainNode = null;
+            }
+            if (audioContext) {
+                audioContext.close().catch(e => console.error(e));
+                audioContext = null;
+            }
+            // 2. Stop microphone track
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            // 3. Send stop signal (empty message) and close socket
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(""); // Send empty message to signal end
+                socket.close(1000, "Client stopped recording");
+            }
+            socket = null;
+        }
+
+        /**
+         * Converts a Float32Array of audio data to a 16-bit PCM Int16Array.
+         */
+        function floatTo16BitPCM(input) {
+            const output = new DataView(new ArrayBuffer(input.length * 2));
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i])); // Clamp to [-1, 1]
+                const val = s < 0 ? s * 0x8000 : s * 0x7FFF; // Scale to 16-bit
+                output.setInt16(i * 2, val, true); // true for little-endian
+            }
+            return output;
+        }
+
+    </script>
+</body>
+</html>
