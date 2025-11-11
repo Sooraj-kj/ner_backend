@@ -3,6 +3,7 @@ import uvicorn
 import os
 import json
 import string 
+# ✨ REMOVED: import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
@@ -34,12 +35,23 @@ except IOError:
     exit()
 
 # =====================================================
-# 2️⃣ ✨ UPDATED: LOAD GENERAL BIOMEDICAL MODEL
+# 2️⃣ LOAD GENERAL SPACY MODEL (Unchanged)
+# =====================================================
+try:
+    # This model is good at finding general entities like DATE and TIME
+    # that the medical models might miss in conversational text.
+    general_nlp = spacy.load("en_core_web_lg")
+    print("✅ en_core_web_lg model loaded successfully.")
+except IOError:
+    print("❌ 'en_core_web_lg' model not found. Run: python -m spacy download en_core_web_lg")
+    exit()
+
+# =====================================================
+# 3️⃣ LOAD GENERAL BIOMEDICAL MODEL (Unchanged)
 # =====================================================
 try:
     hf_auth_token = os.environ.get("HF_TOKEN")
     
-    # ✨ NEW MODEL: This model is broader and finds procedures
     model_name = "d4data/biomedical-ner-all" 
     
     hf_tokenizer = AutoTokenizer.from_pretrained(model_name,token = hf_auth_token)
@@ -57,31 +69,31 @@ except Exception as e:
     exit()
 
 # =====================================================
-# 3️⃣ ✨ UPDATED: ENTITY FILTERING
+# 4️⃣ ENTITY FILTERING (Unchanged)
 # =====================================================
 
-# ✨ NEW LABELS: We now look for procedures, diseases, and symptoms
 ALLOWED_HF_LABELS = {
-    "Disease_disorder",     # Replaces 'DISEASE'
-    "Diagnostic_procedure", # <-- THIS IS THE FIX (for MRI, CT scan)
-    "Sign_symptom"          # Catches things like 'fever', 'headache'
+    "Disease_disorder",
+    "Sign_symptom",
+    "Diagnostic_procedure",
+    "Clinical_event",
+    "Time",
+    "Duration"
 }
 
 CONFIDENCE_THRESHOLD = 0.5 
 
-# We keep the same stop words as they are still useful
 MEDICAL_STOP_WORDS = {
     "hello", "hi", "good", "doctor", "ok", "fine", "thank", "you",
     "see", "it", "that", "now", "when", "so", "is", "a", "an", "the",
     "be", "to", "of", "and", "in", "have", "let's", "let", "wasn't",
     "other", "some", "?", "what", "all", "this", "are", "these",
     "issue", "issues", "people", "two", "for", "symptoms", "symptom",
-    "dolo", "strongness", "thiruvananthapuram", "thenga", "coconut", "hra",
-    "malayalam"
+    
 }
 
 # =====================================================
-# 4️⃣ PYDANTIC MODELS (Unchanged)
+# 5️⃣ PYDANTIC MODELS (Unchanged)
 # =====================================================
 class PrescriptionItem(BaseModel):
     medication: str
@@ -96,15 +108,28 @@ class SymptomItem(BaseModel):
     symptom: str
     duration: Optional[str] = None
 
+class ScanItem(BaseModel):
+    procedure: str
+    
+class FollowUpItem(BaseModel):
+    event: str
+    timeframe: Optional[str] = None
+
 class StructuredSummary(BaseModel):
     prescriptions: List[PrescriptionItem] = []
     symptoms: List[SymptomItem] = []
+    scans: List[ScanItem] = []
+    follow_ups: List[FollowUpItem] = []
     other: List[Dict[str, Any]] = []
 
 # =====================================================
-# 5️⃣ ✨ UPDATED: RULE-BASED STRUCTURING FUNCTION
+# 6️⃣ ✨ UPDATED: RULE-BASED STRUCTURING FUNCTION
 # =====================================================
-def build_structured_summary_rules(text: str, med7_entities: list, openmed_entities: list) -> dict:
+
+# ✨ UPDATED: Function signature now accepts 'general_entities'
+def build_structured_summary_rules(
+    text: str, med7_entities: list, openmed_entities: list, general_entities: list
+) -> dict:
     
     doc = med7_nlp(text)
     summary = StructuredSummary()
@@ -124,8 +149,13 @@ def build_structured_summary_rules(text: str, med7_entities: list, openmed_entit
             ent for ent in openmed_entities
             if ent['start_char'] >= sent_start and ent['end_char'] <= sent_end
         ]
+        # ✨ NEW: Get general entities for this sentence
+        sent_general_ents = [
+            ent for ent in general_entities
+            if ent['start_char'] >= sent_start and ent['end_char'] <= sent_end
+        ]
         
-        # --- 3. Apply Prescription Rule (Unchanged) ---
+        # --- 2. Apply Prescription Rule (Unchanged) ---
         # (This logic for Med7 drugs and modifiers remains the same)
         drugs_in_sentence = [e for e in sent_med7_ents if e['label'] == 'DRUG']
         modifiers = {
@@ -136,7 +166,7 @@ def build_structured_summary_rules(text: str, med7_entities: list, openmed_entit
             "form": [e for e in sent_med7_ents if e['label'] == 'FORM'],
             "route": [e for e in sent_med7_ents if e['label'] == 'ROUTE'],
         }
-
+        # (Prescription logic for 'if len(drugs...) == 1' etc. is unchanged)
         if len(drugs_in_sentence) == 1:
             drug_ent = drugs_in_sentence[0]
             prescription = PrescriptionItem(medication=drug_ent['text'])
@@ -174,9 +204,7 @@ def build_structured_summary_rules(text: str, med7_entities: list, openmed_entit
                 used_entity_spans.add((drug_ent['start_char'], drug_ent['end_char']))
 
         
-        # --- 4. Apply Symptom Rule (✨ UPDATED LOGIC) ---
-        
-        # ✨ Use the new labels from the d4data model
+        # --- 3. Apply Symptom Rule (Unchanged) ---
         symptom_labels = {"Disease_disorder", "Sign_symptom"}
         symptoms_in_sentence = [e for e in sent_openmed_ents if e['label'] in symptom_labels]
         
@@ -190,7 +218,7 @@ def build_structured_summary_rules(text: str, med7_entities: list, openmed_entit
         if duration_text:
             for e in sent_med7_ents:
                 if e['label'] == 'DURATION' and e['text'] in symptom_durations:
-                     used_entity_spans.add((e['start_char'], e['end_char']))
+                        used_entity_spans.add((e['start_char'], e['end_char']))
 
         for sym_ent in symptoms_in_sentence:
             clean_text = sym_ent['text'].lower().strip(punctuation_to_strip)
@@ -203,27 +231,114 @@ def build_structured_summary_rules(text: str, med7_entities: list, openmed_entit
             ))
             used_entity_spans.add((sym_ent['start_char'], sym_ent['end_char']))
 
-    # --- 5. Collect all "other" entities (✨ UPDATED LOGIC) ---
-    # This logic now correctly catches "Diagnostic_procedure"
-    all_entities = med7_entities + openmed_entities
+        # --- 4. Apply Scan/Procedure Rule (Unchanged) ---
+        procedure_labels = {"Diagnostic_procedure"}
+        procedures_in_sentence = [e for e in sent_openmed_ents if e['label'] in procedure_labels]
+
+        for proc_ent in procedures_in_sentence:
+            clean_text = proc_ent['text'].lower().strip(punctuation_to_strip)
+            if clean_text in MEDICAL_STOP_WORDS:
+                continue 
+            
+            if (proc_ent['start_char'], proc_ent['end_char']) not in used_entity_spans:
+                summary.scans.append(ScanItem(procedure=proc_ent['text']))
+                used_entity_spans.add((proc_ent['start_char'], proc_ent['end_char']))
+
+
+        # --- 5. ✨ UPDATED: Apply Follow-up Rule (NER-Only) ---
+        
+        # 1. Find timeframes (from ALL models)
+        follow_up_times_hf = [
+            e for e in sent_openmed_ents 
+            if e['label'] in {'Time', 'Duration'}
+            and (e['start_char'], e['end_char']) not in used_entity_spans
+        ]
+        follow_up_durations_med7 = [
+            e for e in sent_med7_ents
+            if e['label'] == 'DURATION'
+            and (e['start_char'], e['end_char']) not in used_entity_spans
+        ]
+        follow_up_times_general = [
+            e for e in sent_general_ents
+            if e['label'] in {'DATE', 'TIME'} # DATE (e.g., "two days")
+            and (e['start_char'], e['end_char']) not in used_entity_spans
+        ]
+        all_timeframes = follow_up_times_hf + follow_up_durations_med7 + follow_up_times_general
+        
+        # 2. Find events (from HF model)
+        follow_up_events_hf = [
+            e for e in sent_openmed_ents 
+            if e['label'] == 'Clinical_event'
+            and (e['start_char'], e['end_char']) not in used_entity_spans
+        ]
+
+        # 3. ✨ REMOVED: Rule-based keyword matching
+        # (The re.finditer and FOLLOW_UP_KEYWORDS logic has been removed)
+            
+        # ✨ CHANGED: 'all_events' now only uses NER-based events
+        all_events = follow_up_events_hf
+        
+        # 4. Apply the rule
+        if all_events and all_timeframes:
+            # Only add if we have BOTH an event and a timeframe
+            event_ent = all_events[0] # Take the first one found
+            time_ent = all_timeframes[0]
+            time_text = time_ent['text']
+            
+            # Mark both as used
+            used_entity_spans.add((time_ent['start_char'], time_ent['end_char']))
+            # We know the event is not 'Rule-based' so we can safely add it
+            used_entity_spans.add((event_ent['start_char'], event_ent['end_char']))
+
+            summary.follow_ups.append(FollowUpItem(
+                event=event_ent['text'].capitalize(),
+                timeframe=time_text
+            ))
+
+
+    # --- 6. ✨ UPDATED: Collect "other" entities ---
+    
+    # ✨ Combine entities from ALL sources
+    all_entities = med7_entities + openmed_entities + general_entities
+    
+    # ✨ NEW: Labels we use for rules, but don't want in "other"
+    LABELS_TO_SKIP_IN_OTHER = {"Time", "Duration", "DATE", "TIME"}
+    
     for ent in all_entities:
         if (ent['start_char'], ent['end_char']) not in used_entity_spans:
             clean_text = ent['text'].lower().strip(punctuation_to_strip)
             if clean_text in MEDICAL_STOP_WORDS:
                 continue 
             
-            if ent.get("source") == "d4data-biomedical-ner-all": # Source name changed
-                 if ent.get('score', 0) < CONFIDENCE_THRESHOLD:
-                     continue
+            # ✨ NEW: Skip labels we don't want in "other"
+            if ent['label'] in LABELS_TO_SKIP_IN_OTHER:
+                continue
+
+            # ✨ NEW: Skip entities that are too long (likely ASR noise)
+            if len(ent['text'].split()) > 5:
+                continue
+
+            # --- Confidence Check for HF Model ---
+            if ent.get("source") == "d4data-biomedical-ner-all":
+                if ent.get('score', 0) < CONFIDENCE_THRESHOLD:
+                    continue
             
-            summary.other.append(ent)
+            # --- Add the entity ---
+            if ent.get("source") == "Med7":
+                 summary.other.append(ent)
+            elif ent.get("source") == "en_core_web_lg":
+                 # This will only be PER, ORG, etc. since we skip DATE/TIME
+                 summary.other.append(ent)
+            elif ent.get("label") in ALLOWED_HF_LABELS:
+                 summary.other.append(ent)
+            
             
     # Use .dict() for Pydantic v1
     return summary.dict(exclude_none=True)
 
 
 # =====================================================
-# 6️⃣ WEBSOCKET ENDPOINT (Unchanged, but logic is updated)
+# 7️⃣ ✨ UPDATED: WEBSOCKET ENDPOINT
 # =====================================================
 @app.websocket("/ws/ner")
 async def ner_websocket(websocket: WebSocket):
@@ -239,7 +354,7 @@ async def ner_websocket(websocket: WebSocket):
                 continue
 
             print(f"--- 1. RECEIVED TEXT: {text}")
-
+            print("--- PROCESSING NER...")
             # --- 2. Run Med7 (Unchanged) ---
             med7_doc = med7_nlp(text) 
             med7_entities = [
@@ -251,8 +366,21 @@ async def ner_websocket(websocket: WebSocket):
             ]
             print(f"--- 2. MED7 FOUND: {med7_entities}")
 
-            # --- 3. Run General HF Model (Unchanged) ---
-            # This pipeline now uses the new model and will find procedures
+            # --- 3. ✨ NEW: Run General Spacy Model ---
+            general_doc = general_nlp(text)
+            general_entities = [
+                {
+                    "text": ent.text, "label": ent.label_, "source": "en_core_web_lg",
+                    "start_char": ent.start_char, "end_char": ent.end_char
+                }
+                # ✨ Get DATE/TIME but also general stuff in case 'other' is useful
+                for ent in general_doc.ents
+                if ent.label_ in {"DATE", "TIME", "PERSON", "ORG", "GPE"}
+            ]
+            print(f"--- 3. GENERAL SPACY FOUND: {general_entities}")
+
+
+            # --- 4. Run General HF Model (Re-numbered) --- 
             openmed_entities = []
             try:
                 openmed_output = hf_pipeline(text)
@@ -260,24 +388,23 @@ async def ner_websocket(websocket: WebSocket):
                     {
                         "text": ent["word"], "label": ent["entity_group"],
                         "score": float(ent["score"]), 
-                        "source": "d4data-biomedical-ner-all", # ✨ Updated source name
+                        "source": "d4data-biomedical-ner-all",
                         "start_char": int(ent["start"]), "end_char": int(ent["end"])
                     }
                     for ent in openmed_output
-                    # This line now checks against the new ALLOWED_HF_LABELS
                     if ent["entity_group"] in ALLOWED_HF_LABELS
                 ]
-                print(f"--- 3. HUGGINGFACE FOUND: {openmed_entities}")
+                print(f"--- 4. HUGGINGFACE FOUND: {openmed_entities}")
             except Exception as e:
                 print(f"⚠️ Error processing HuggingFace pipeline: {e}")
 
-            # --- 4. Call Rule-Based Structuring Function (Unchanged) ---
-            print("--- 4. CALLING RULE-BASED STRUCTURING...")
+            # --- 5. ✨ UPDATED: Call Rule-Based Structuring ---
+            print("--- 5. CALLING RULE-BASED STRUCTURING...")
             structured_data = build_structured_summary_rules(
-                text, med7_entities, openmed_entities
+                text, med7_entities, openmed_entities, general_entities # ✨ Pass new list
             )
             
-            print(f"--- 5. SENDING STRUCTURED DATA: {structured_data}")
+            print(f"--- 6. SENDING STRUCTURED DATA: {structured_data}")
             await websocket.send_json(structured_data)
             print("="*50 + "\n")
 
@@ -288,7 +415,7 @@ async def ner_websocket(websocket: WebSocket):
         await websocket.close(code=1011)
 
 # =====================================================
-# 7️⃣ RUN SERVER (Unchanged)
+# 8️⃣ RUN SERVER (Unchanged)
 # =====================================================
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
